@@ -1,0 +1,40 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+        {
+            "name": "Finetune",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+                "PYTHONPATH": ".",
+                "WANDB_MODE": "offline",
+            },
+            "args": [
+                "--num_processes=1",
+                "--main_process_port=0",
+                "finetune.py",
+                "--config", "config.py",
+                "--config.sample.m=1", "--config.sample.k=4",
+                "--config.train.effective_batch_size=4",
+                "--config.sample.batch_size_per_device=4",
+                "--config.train.batch_size_per_device=4",
+                "--config.test.batch_size_per_device=4",
+            ]
+        }
+    ]
+}

@@ -1,0 +1,24 @@
+name: fsd
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - nvidia/label/cuda-12.8.1::cuda-toolkit
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch~=2.8
+    - torchvision~=0.23
+    - transformers
+    - huggingface-hub
+    - accelerate
+    - diffusers
+    - sentencepiece
+    - einops
+    - wandb
+    - bitsandbytes
+    - ml-collections
+    - gpytorch
+    - deepspeed
+    - peft
