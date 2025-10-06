@@ -1,7 +1,7 @@
 from collections import defaultdict
 import contextlib
 import os
-import datetime
+import time
 from concurrent import futures
 from accelerate.utils import set_seed
 from absl import app, flags
@@ -23,8 +23,8 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftMode
 import random
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 from torch.utils.data import Dataset, DataLoader, Sampler
-from rewards import AestheticScorer, PickScoreScorer
-from pipeline_extensions import ExtendPipeline, FlowMatchEulerDiscreteSdeScheduler
+from rewards import REWARDS_CLS
+from pipeline_extensions import ExtendPipeline, FlowMatchEulerDiscreteSdeScheduler, batch_cache
 from reward_normalizer import RewardNormalizer
 
 FLAGS = flags.FLAGS
@@ -83,7 +83,7 @@ def main(_):
     accelerator.init_trackers(
         project_name="finetune-stable-diffusion",
         config=config,
-        init_kwargs={"wandb": {"name": config.run_name}}
+        init_kwargs={"wandb": {"name": config.run_name, "config": config.to_dict()}}
     )
     set_seed(config.seed, device_specific=True)
     Pipeline = type('ExtendPipeline', (ExtendPipeline, StableDiffusion3Pipeline), {})
@@ -95,6 +95,7 @@ def main(_):
     pipeline.scheduler = FlowMatchEulerDiscreteSdeScheduler.from_config(pipeline.scheduler.config)
     pipeline.to(accelerator.device)
     pipeline.vae.enable_slicing()
+    pipeline.encode_prompt = batch_cache(max_size=16)(pipeline.encode_prompt)
 
     [ module.requires_grad_(False) for module in pipeline.text_encoder.modules() if isinstance(module, torch.nn.Module) ]
 
@@ -129,7 +130,8 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    reward_fn = PickScoreScorer()
+    RewardCls = REWARDS_CLS[config.reward]
+    reward_fn = RewardCls()
     reward_fn.to(accelerator.device)
 
     train_dataset = DistributedSubsampleDataset(dataset_dir=config.dataset_dir, split='train', m=config.sample.m, k=config.sample.k, base_seed=config.seed)
@@ -143,28 +145,30 @@ def main(_):
     transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
 
 
-    for epoch in range(config.max_epochs):
+    for epoch in tqdm(range(config.max_epochs), desc="Epochs", position=0, disable=not accelerator.is_main_process):
         pipeline.transformer.eval()
         train_dataset.subsample(epoch)
         training_data = []
         
         # ------------------ Sampling ------------------ #
-        for prompt_ids in train_dataloader:
+        for prompt_ids in tqdm(train_dataloader, desc="Sampling", position=1, leave=False, disable=not accelerator.is_main_process):
             
             batch_size = len(prompt_ids)
             prompts = train_dataset.indices_to_data(prompt_ids)
             
-            with accelerator.autocast():
-                with torch.no_grad():
-                    images = pipeline(
-                        prompts,
-                        guidance_scale=config.diffusion.guidance_scale,
-                        num_inference_steps=config.sample.diffusion_steps,
-                    ).images
+            with torch.no_grad():
+                images = pipeline(
+                    prompts,
+                    guidance_scale=config.diffusion.guidance_scale,
+                    num_inference_steps=config.sample.diffusion_steps,
+                    height=config.diffusion.resolution,
+                    width=config.diffusion.resolution,
+                ).images
             trajectory_data = pipeline.scheduler.collect_trajectory_data()
             trajectory_data = {k: torch.stack([d[k] for d in trajectory_data], dim=1) for k in trajectory_data[0]} 
             
             rewards = reward_fn(images, prompts)
+            rewards = rewards.to(device=accelerator.device, dtype=torch.float32)
 
             training_data.append({
                     "prompt_ids": prompt_ids,
@@ -192,10 +196,13 @@ def main(_):
         # ------------------ Training ------------------ #
         pipeline.transformer.train()
         timesteps, _ = retrieve_timesteps(pipeline.scheduler, num_inference_steps=config.sample.diffusion_steps, device=accelerator.device)
-        for training_batch in batches_dict(training_data, config.train.batch_size_per_device):
+        
+        training_batches = list(batches_dict(training_data, config.train.batch_size_per_device))
+        for training_batch in tqdm(training_batches, desc="Training Batches", position=1, leave=False, disable=not accelerator.is_main_process):
             prompts = train_dataset.indices_to_data(training_batch["prompt_ids"])
-            for i, timestep in enumerate(timesteps):
-                with accelerator.accumulate(transformer), accelerator.autocast():
+            
+            for i, timestep in tqdm(enumerate(timesteps), desc="Timesteps", position=2, leave=False, total=len(timesteps), disable=not accelerator.is_main_process):
+                with accelerator.accumulate(transformer):
 
                     with torch.enable_grad():
                         prev_sample_mean = pipeline.sample_one_step_mean(prompts, training_batch["sample"][:,i], timestep, guidance_scale=config.diffusion.guidance_scale)
@@ -234,7 +241,6 @@ def main(_):
                         accelerator.clip_grad_norm_(transformer.parameters(), config.train.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad()
-
         # ------------------ Logging ------------------ #
         accelerator.log({
             "epoch": epoch,

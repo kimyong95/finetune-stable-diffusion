@@ -3,8 +3,10 @@ from transformers import CLIPModel, CLIPProcessor
 from torch import nn
 from huggingface_hub import hf_hub_download
 from PIL import Image
-from typing import List
-
+from typing import List, Optional, Union
+import numpy as np
+from paddleocr import PaddleOCR
+from Levenshtein import distance
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -22,7 +24,19 @@ class MLP(nn.Module):
     def forward(self, embed):
         return self.layers(embed)
 
-class AestheticScorer(torch.nn.Module):
+class BaseReward(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    @torch.no_grad()
+    def __call__(self, images: List[Image.Image], prompts: Optional[List[str]] = None) -> torch.Tensor:
+        raise NotImplementedError()
+
+class Aesthetic(BaseReward):
     def __init__(self):
         super().__init__()
         self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
@@ -33,20 +47,15 @@ class AestheticScorer(torch.nn.Module):
         self.mlp.load_state_dict(state_dict)
         self.eval()
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
-
     @torch.no_grad()
-    def __call__(self, images: List[Image.Image]) -> torch.Tensor:
+    def __call__(self, images: List[Image.Image], prompts = None) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         embed = self.clip.get_image_features(**inputs)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed).squeeze(1)
 
-
-class PickScoreScorer(torch.nn.Module):
+class PickScore(BaseReward):
     def __init__(self):
         super().__init__()
         processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
@@ -54,10 +63,6 @@ class PickScoreScorer(torch.nn.Module):
         self.processor = CLIPProcessor.from_pretrained(processor_path)
         self.model = CLIPModel.from_pretrained(model_path)
         self.eval()
-
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
 
     @torch.no_grad()
     def __call__(self, images: List[Image.Image], prompts: List[str]) -> torch.Tensor:
@@ -94,3 +99,62 @@ class PickScoreScorer(torch.nn.Module):
         # norm to 0-1
         scores = scores/26
         return scores
+
+
+class OCR(BaseReward):
+    def __init__(self, use_gpu: bool = False):
+        super().__init__()
+        self.ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang="en",
+            use_gpu=use_gpu,
+            show_log=False
+        )
+        self.eval()
+
+    @torch.no_grad()
+    def __call__(self, images: List[Image.Image], prompts: List[str]) -> torch.Tensor:
+        # Extract text from prompts (assuming format like 'text with "target text"')
+        prompts = [prompt.split('"')[1] for prompt in prompts]
+        rewards = []
+        
+        # Ensure input lengths are consistent
+        assert len(images) == len(prompts), "Images and prompts must have the same length"
+        
+        for img, prompt in zip(images, prompts):
+            # Convert PIL Image to numpy array
+            img = np.array(img)
+            
+            try:
+                # OCR recognition
+                result = self.ocr.ocr(img, cls=False)
+                # Extract recognized text (handle possible multi-line results)
+                recognized_text = ''.join([res[1][0] if res[1][1] > 0 else '' for res in result[0]]) if result[0] else ''
+                
+                recognized_text = recognized_text.replace(' ', '').lower()
+                prompt = prompt.replace(' ', '').lower()
+                
+                if prompt in recognized_text:
+                    dist = 0
+                else:
+                    dist = distance(recognized_text, prompt)
+                # Recognized many unrelated characters, only add one character penalty
+                if dist > len(prompt):
+                    dist = len(prompt)
+                
+            except Exception as e:
+                # Error handling (e.g., OCR parsing failure)
+                print(f"OCR processing failed: {str(e)}")
+                dist = len(prompt)  # Maximum penalty
+            
+            reward = 1 - dist / len(prompt)
+            rewards.append(reward)
+
+        return torch.tensor(rewards, dtype=torch.float32)
+
+
+REWARDS_CLS = {
+    "aesthetic": Aesthetic,
+    "pickscore": PickScore,
+    "ocr": OCR,
+}

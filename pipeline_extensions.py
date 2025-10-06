@@ -1,9 +1,67 @@
 from typing import List, Union
 import torch
 from diffusers import StableDiffusion3Pipeline
+import collections
+from functools import wraps
+import inspect
+from typing import List, Union, Optional, Tuple
+
+
+def batch_cache(max_size: int = 16):
+    """
+    A decorator to cache responses for batch functions at an item level with an LRU policy.
+    
+    Arguments with a value of `None` are ignored when creating the cache key.
+    
+    Assumes:
+    - The decorated function takes list arguments for batching.
+    - All list arguments representing the batch have the same length.
+    - The function returns a tuple of tensors, where the first dimension is the batch size.
+    """
+    cache = collections.OrderedDict()
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 1. Bind args/kwargs and find batch size
+            bound_args = inspect.signature(func).bind(*args, **kwargs).arguments
+            batch_size = next((len(v) for v in bound_args.values() if isinstance(v, list)), 0)
+            if not batch_size: return func(*args, **kwargs)
+
+            # 2. Create a unique key for each item, ignoring None-valued arguments
+            scalar_args = tuple(sorted((k, v) for k, v in bound_args.items() if v is not None and not isinstance(v, list) ))
+            list_args = {k: v for k, v in bound_args.items() if v is not None and isinstance(v, list) and len(v) == batch_size}
+            keys = [scalar_args + tuple(sorted((k, v[i]) for k, v in list_args.items())) for i in range(batch_size)]
+
+            # 3. Separate cache hits from misses
+            results, miss_indices = [None] * batch_size, []
+            for i, key in enumerate(keys):
+                if key in cache:
+                    cache.move_to_end(key)
+                    results[i] = cache[key]
+                else:
+                    miss_indices.append(i)
+
+            # 4. Call the original function for misses using original arguments
+            if miss_indices:
+                miss_kwargs = {k: [v[i] for i in miss_indices] if k in list_args else v for k, v in bound_args.items()}
+                miss_results = func(**miss_kwargs)
+                
+                # 5. Cache new results
+                for i, original_idx in enumerate(miss_indices):
+                    item_result = tuple(t[i] for t in miss_results)
+                    results[original_idx] = item_result
+                    cache[keys[original_idx]] = item_result
+                    if len(cache) > max_size: cache.popitem(last=False)
+
+            # 6. Reconstruct the full batch tensor output
+            return tuple(torch.stack(tensors) for tensors in zip(*results))
+
+        return wrapper
+    return decorator
 
 class ExtendPipeline:
-
+    
     def sample_one_step_mean(
         self: Union[StableDiffusion3Pipeline],
         prompt: List[str],
@@ -13,7 +71,7 @@ class ExtendPipeline:
         max_sequence_length: int = 256,
     ):
         with torch.no_grad():
-            (prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds) = self.encode_prompt(prompt=prompt,prompt_2=prompt,prompt_3=prompt,do_classifier_free_guidance=self.do_classifier_free_guidance,device=self._execution_device,num_images_per_prompt=1,max_sequence_length=max_sequence_length)
+            (prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds) = self.encode_prompt(prompt=prompt,prompt_2=None,prompt_3=None,do_classifier_free_guidance=self.do_classifier_free_guidance,device=self._execution_device,num_images_per_prompt=1,max_sequence_length=max_sequence_length)
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
         
@@ -73,6 +131,7 @@ class FlowMatchEulerDiscreteSdeScheduler(FlowMatchEulerDiscreteScheduler):
             self._init_step_index(timestep)
 
         # Upcast to avoid precision issues when computing prev_sample
+        sample_dtype = sample.dtype
         sample = sample.to(torch.float32)
 
         sigma_idx = self.step_index
@@ -100,6 +159,7 @@ class FlowMatchEulerDiscreteSdeScheduler(FlowMatchEulerDiscreteScheduler):
             "prev_sample": prev_sample,
             "prev_sample_mean": prev_sample_mean,
         }
+        prev_sample = prev_sample.to(sample_dtype)
         # --------------------------------------- #
 
         # upon completion increase step index by one
