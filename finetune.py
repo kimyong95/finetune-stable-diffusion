@@ -3,6 +3,7 @@ import contextlib
 import os
 import time
 from concurrent import futures
+import itertools
 from accelerate.utils import set_seed
 from absl import app, flags
 from ml_collections import config_flags
@@ -192,6 +193,12 @@ def main(_):
 
         # un-gather
         training_data["advantages"] = einops.rearrange(gathered_advantages,'(process batch) -> process batch',process=accelerator.num_processes)[accelerator.process_index]
+
+        non_zero_mask = training_data["advantages"] != 0
+        training_data = {
+            key: value[non_zero_mask] if isinstance(value, torch.Tensor) else list(itertools.compress(value, non_zero_mask))
+            for key, value in training_data.items()
+        }
 
         # ------------------ Training ------------------ #
         pipeline.transformer.train()
