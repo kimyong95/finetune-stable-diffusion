@@ -33,10 +33,15 @@ config_flags.DEFINE_config_file("config", "config.py", "Configuration.")
 
 class DistributedSubsampleDataset(Dataset):
     
-    def __init__(self, dataset_dir, split, m, k, base_seed=0):
-        self.dataset_path = os.path.join(dataset_dir, f'{split}.txt')
-        with open(self.dataset_path, 'r') as f:
-            self.all_data = [line.strip() for line in f.readlines()]
+    def __init__(self, m, k, base_seed=0, dataset_dir=None, split=None, one_prompt=None):
+        assert (dataset_dir is not None) ^ (one_prompt is not None), "Exactly one of 'dataset_dir' or 'one_prompt' must be defined"
+        
+        if dataset_dir is not None:
+            with open(os.path.join(dataset_dir, f'{split}.txt'), 'r') as f:
+                self.all_data = [line.strip() for line in f.readlines()]
+        elif one_prompt is not None:
+            self.all_data = [one_prompt] * m
+        
         self.N = len(self.all_data)
         self.m = m if m > 0 else self.N  # if m is -1, use the full dataset
         self.k = k
@@ -135,11 +140,11 @@ def main(_):
     reward_fn = RewardCls()
     reward_fn.to(accelerator.device)
 
-    train_dataset = DistributedSubsampleDataset(dataset_dir=config.dataset_dir, split='train', m=config.sample.m, k=config.sample.k, base_seed=config.seed)
-    test_dataset = DistributedSubsampleDataset(dataset_dir=config.dataset_dir, split='test', m=-1, k=1, base_seed=config.seed)
+    train_dataset = DistributedSubsampleDataset(dataset_dir=config.dataset_dir, split="train", one_prompt=config.dataset_one_prompt, m=config.sample.m, k=config.sample.k, base_seed=config.seed)
+    test_dataset = DistributedSubsampleDataset(dataset_dir=config.dataset_dir, split="test", one_prompt=config.dataset_one_prompt, m=-1, k=1, base_seed=config.seed)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=config.sample.batch_size_per_device, shuffle=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=config.test.batch_size_per_device, shuffle=False)
+    train_dataloader = DataLoader(train_dataset, batch_size=config.sample.batch_size_per_device)
+    test_dataloader = DataLoader(test_dataset, batch_size=config.test.batch_size_per_device)
 
     reward_normalizer = RewardNormalizer()
 
@@ -205,18 +210,19 @@ def main(_):
         timesteps, _ = retrieve_timesteps(pipeline.scheduler, num_inference_steps=config.sample.diffusion_steps, device=accelerator.device)
         
         training_batches = list(batches_dict(training_data, config.train.batch_size_per_device))
+        
         for training_batch in tqdm(training_batches, desc="Training Batches", position=1, leave=False, disable=not accelerator.is_main_process):
             prompts = train_dataset.indices_to_data(training_batch["prompt_ids"])
             
             for i, timestep in tqdm(enumerate(timesteps), desc="Timesteps", position=2, leave=False, total=len(timesteps), disable=not accelerator.is_main_process):
                 with accelerator.accumulate(transformer):
-
+                    
                     with torch.enable_grad():
                         prev_sample_mean = pipeline.sample_one_step_mean(prompts, training_batch["sample"][:,i], timestep, guidance_scale=config.diffusion.guidance_scale)
 
                     with accelerator.unwrap_model(transformer).disable_adapter(), torch.no_grad():
                         prev_sample_mean_ref = pipeline.sample_one_step_mean(prompts, training_batch["sample"][:,i], timestep, guidance_scale=config.diffusion.guidance_scale)
-                    
+
                     # p_θ(x_{t-1}|x_t) in the paper
                     curr_log_prob = pipeline.scheduler.calculate_log_prob(prev_sample_mean=prev_sample_mean, prev_sample=training_batch["prev_sample"][:,i], timestep=timestep)
                     

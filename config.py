@@ -10,6 +10,8 @@ def get_config():
 
     config.run_name = "grpo"
     config.dataset_dir = "dataset/ocr"
+    config.dataset_one_prompt = None
+    # config.dataset_one_prompt = "Traffic light with lights from top to bottom: green, yellow, red."
 
     config.diffusion = ml_collections.ConfigDict()
     config.diffusion.model = "stabilityai/stable-diffusion-3.5-medium"
@@ -20,8 +22,8 @@ def get_config():
     config.sample = ml_collections.ConfigDict()
     config.sample.batch_size_per_device = 16
     # total number of samples (across all devices) = m * k
-    config.sample.m = 2     # unique prompt per epoch (across all devices)
-    config.sample.k = 32    # repeats the unique prompt
+    config.sample.m = 8     # unique prompt per epoch (across all devices)
+    config.sample.k = 8     # repeats the unique prompt
     config.sample.diffusion_steps = 10
 
     config.reward = "ocr"

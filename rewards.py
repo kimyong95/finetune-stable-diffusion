@@ -1,5 +1,5 @@
 import torch
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, CLIPProcessor, AutoProcessor, Gemma3nForConditionalGeneration
 from torch import nn
 from huggingface_hub import hf_hub_download
 from PIL import Image
@@ -7,6 +7,9 @@ from typing import List, Optional, Union
 import numpy as np
 from paddleocr import PaddleOCR
 from Levenshtein import distance
+import re
+import inspect
+import time
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -152,9 +155,132 @@ class OCR(BaseReward):
 
         return torch.tensor(rewards, dtype=torch.float32)
 
+class Gemma(BaseReward):
+    def __init__(self, device: str = "cuda"):
+        super().__init__()
+        self.system_prompt = (
+            "You are a helpful assistant with advanced reasoning ability. "
+            "Always analyze the task carefully step by step before giving your final response. "
+            "Use natural language, do not use tool/function calling. "
+            "Enclose your internal reasoning within <think> ... </think> tags. "
+        )
+        self.question_template = inspect.cleandoc("""
+            Based on your description, determine how accurately the image adheres to the text prompt: "{prompt}"
+            Assign a rating from 1 to 5 based on the criteria below:
+            - 1 = Does not match at all
+            - 2 = Partial match, some elements correct, others missing/wrong
+            - 3 = Fair match, but several details off
+            - 4 = Good match, only minor details off
+            - 5 = Perfect match
+            Provide your final rating in the format: @answer=rating
+        """)
+        self.answer_pattern = re.compile(r"@answer=(\d+)")
+
+        model_id = "google/gemma-3n-e4b-it"
+        
+        self.model = Gemma3nForConditionalGeneration.from_pretrained(
+            model_id,
+            device_map=device,
+            torch_dtype=torch.bfloat16,
+        )
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.eval()
+
+    def _build_message(self, text, image=None, role="user"):
+        content = []
+        if image is not None:
+            content.append({"type": "image", "image": image})
+        content.append({"type": "text", "text": text})
+        message = {"role": role, "content": content}
+        return message
+
+    def _extract_score(self, reply):
+        match = self.answer_pattern.search(reply)
+        if match:
+            return float(match.group(1))
+        else:
+            return None
+
+    def send_messages_batch(
+        self,
+        batch_messages: List[List[dict]],
+        max_input_len: int = 2048,
+        temperature: float = 0.0,
+        batch_size: int = 8,
+    ) -> List[str]:
+        all_replies: List[str] = []
+        for start_idx in range(0, len(batch_messages), batch_size):
+            mini_batch = batch_messages[start_idx:start_idx + batch_size]
+
+            inputs = self.processor.apply_chat_template(
+                mini_batch,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=max_input_len
+            ).to(self.device)
+
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=int(max_input_len//2),
+                    do_sample=not temperature > 0.0,
+                    temperature=temperature if temperature > 0.0 else None,
+                )
+            replies = self.processor.tokenizer.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            all_replies.extend(replies)
+
+        return all_replies
+
+    @torch.no_grad()
+    def __call__(self, images: List[Image.Image], prompts: List[str]) -> torch.Tensor:
+        N = len(prompts)
+        messages: List[List[dict]] = []
+        for pil_img in images:
+            messages.append([
+                self._build_message(self.system_prompt, role="system"),
+                self._build_message("Provide a detailed description of this image.", image=pil_img, role="user"),
+            ])
+        
+        desc_replies = self.send_messages_batch(messages)
+        
+        for i, rep in enumerate(desc_replies):
+            messages[i].append(self._build_message(rep, role="assistant"))
+            messages[i].append(self._build_message(self.question_template.format(prompt=prompts[i])))
+
+        failed_indices = list(range(N))
+        scores = [0.0 for _ in range(N)]
+        try_atempts = 0
+        while len(failed_indices) > 0:
+            try_messages = [messages[i] for i in failed_indices]
+            temperature = try_atempts * 0.1
+            replies = self.send_messages_batch(try_messages, temperature=temperature)
+
+            next_failed_indices = []
+            for idx, reply in zip(failed_indices, replies):
+                score = self._extract_score(reply)
+                if score is not None:
+                    scores[idx] = score
+                else:
+                    print(f"Retrying due to parse failure in reply: {reply}")
+                    next_failed_indices.append(idx)
+            
+            failed_indices = next_failed_indices
+            try_atempts += 1
+            
+            if try_atempts > 5: # safety break
+                print("Exceeded max retry attempts.")
+                break
+
+        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+
 
 REWARDS_CLS = {
     "aesthetic": Aesthetic,
     "pickscore": PickScore,
     "ocr": OCR,
+    "gemma": Gemma,
 }

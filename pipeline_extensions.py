@@ -6,7 +6,6 @@ from functools import wraps
 import inspect
 from typing import List, Union, Optional, Tuple
 
-
 def batch_cache(max_size: int = 16):
     """
     A decorator to cache responses for batch functions at an item level with an LRU policy.
@@ -92,7 +91,6 @@ class ExtendPipeline:
         _ = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
         step_index = self.scheduler.index_for_timestep(timestep)
         prev_sample_mean = self.scheduler.collect_trajectory_data()[step_index]["prev_sample_mean"]
-
         return prev_sample_mean
 
 import torch
