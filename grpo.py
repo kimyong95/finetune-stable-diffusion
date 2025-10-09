@@ -128,6 +128,7 @@ class Trainer:
             target_modules=target_modules,
         )
         self.pipeline.transformer = get_peft_model(self.pipeline.transformer, transformer_lora_config)
+        self.transformer = self.pipeline.transformer
         
         if self.config.train.gradient_checkpointing:
             self.pipeline.transformer.enable_gradient_checkpointing()
