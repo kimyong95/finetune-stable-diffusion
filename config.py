@@ -42,8 +42,10 @@ def get_config():
     config.train.beta = 0.04
     config.train.effective_batch_size = 32  # acheive via gradient accumulation steps
 
-    config.test = ml_collections.ConfigDict()
-    config.test.batch_size_per_device = 32
-    config.test.diffusion_steps = 40
+    config.eval = ml_collections.ConfigDict()
+    config.eval.log_images = 32
+    config.eval.batch_size_per_device = 32
+    config.eval.diffusion_steps = 40
+    config.eval.frequency = 50
 
     return config

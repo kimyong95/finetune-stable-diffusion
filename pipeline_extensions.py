@@ -129,7 +129,6 @@ class FlowMatchEulerDiscreteSdeScheduler(FlowMatchEulerDiscreteScheduler):
             self._init_step_index(timestep)
 
         # Upcast to avoid precision issues when computing prev_sample
-        sample_dtype = sample.dtype
         sample = sample.to(torch.float32)
 
         sigma_idx = self.step_index
@@ -157,7 +156,6 @@ class FlowMatchEulerDiscreteSdeScheduler(FlowMatchEulerDiscreteScheduler):
             "prev_sample": prev_sample,
             "prev_sample_mean": prev_sample_mean,
         }
-        prev_sample = prev_sample.to(sample_dtype)
         # --------------------------------------- #
 
         # upon completion increase step index by one
