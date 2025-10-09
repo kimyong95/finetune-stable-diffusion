@@ -109,10 +109,8 @@ class Trainer:
         self.pipeline.scheduler = FlowMatchEulerDiscreteSdeScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.to(self.accelerator.device)
         self.pipeline.vae.enable_slicing()
-        self.pipeline.encode_prompt = batch_cache(max_size=16)(self.pipeline.encode_prompt)
-
-        [ module.requires_grad_(False) for module in self.pipeline.text_encoder.modules() if isinstance(module, torch.nn.Module) ]
-
+        self.pipeline.encode_prompt = batch_cache(max_size=32)(self.pipeline.encode_prompt)
+        [ comp.requires_grad_(False) for comp in self.pipeline.components.values() if isinstance(comp, torch.nn.Module) ] # disable all gradients
         target_modules = [
             "attn.add_k_proj",
             "attn.add_q_proj",
@@ -133,7 +131,6 @@ class Trainer:
         
         if self.config.train.gradient_checkpointing:
             self.pipeline.transformer.enable_gradient_checkpointing()
-        self.transformer = self.pipeline.transformer
         transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, self.transformer.parameters()))
 
         self.optimizer = torch.optim.AdamW(
@@ -197,7 +194,7 @@ class Trainer:
         
         all_rewards = torch.cat(all_rewards, dim=0)
         gathered_rewards = self.accelerator.gather(all_rewards)
-        self.log_rewards(rewards=gathered_rewards, stage="eval")
+        self.log_rewards(epoch=epoch, rewards=gathered_rewards, stage="eval")
 
         # assume single device generated images is enough for logging
         log_images = log_images[:self.config.eval.log_images]
