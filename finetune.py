@@ -193,12 +193,14 @@ class Trainer:
             rewards = self.reward_fn(images, prompts)
             rewards = rewards.to(device=self.accelerator.device, dtype=torch.float32)
             all_rewards.append(rewards)
-            log_images.extend(images)[:self.config.eval.log_images]
+            log_images.extend(images)
         
         all_rewards = torch.cat(all_rewards, dim=0)
         gathered_rewards = self.accelerator.gather(all_rewards)
         self.log_rewards(rewards=gathered_rewards, stage="eval")
 
+        # assume single device generated images is enough for logging
+        log_images = log_images[:self.config.eval.log_images]
         log_images_rewards = all_rewards[:self.config.eval.log_images]
         self.log_images(epoch=epoch, rewards=log_images_rewards, images=log_images, stage="eval")
 
